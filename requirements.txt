@@ -1,5 +1,6 @@
 streamlit
-pymupdf
-sentence-transformers
-faiss-cpu
 numpy
+faiss-cpu
+sentence-transformers
+pymupdf
+ollama

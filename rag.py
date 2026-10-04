@@ -1,15 +1,18 @@
 import json
+import os
+import re
+
 import numpy as np
 import faiss
-import re
+import streamlit as st
 import ollama
 
 from sentence_transformers import SentenceTransformer
 
 
-# ==========================================
-# LOAD TEXTBOOK CHUNKS
-# ==========================================
+# ============================================================
+# LOAD TEXTBOOK DATA
+# ============================================================
 
 with open("chunks.json", "r", encoding="utf-8") as file:
     chunks = json.load(file)
@@ -17,30 +20,31 @@ with open("chunks.json", "r", encoding="utf-8") as file:
 print(f"Loaded {len(chunks)} chunks")
 
 
-# ==========================================
-# LOAD EMBEDDINGS
-# ==========================================
+# ============================================================
+# LOAD EMBEDDINGS + FAISS
+# ============================================================
 
 embeddings = np.load("embeddings.npy")
 
 dimension = embeddings.shape[1]
 
 index = faiss.IndexFlatL2(dimension)
+
 index.add(embeddings)
 
 print(f"FAISS index contains {index.ntotal} chunks")
 
 
-# ==========================================
+# ============================================================
 # EMBEDDING MODEL
-# ==========================================
+# ============================================================
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-# ==========================================
-# NORMALIZE TEXT
-# ==========================================
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
 
 def normalize(text):
 
@@ -61,9 +65,9 @@ def normalize(text):
     return text.strip()
 
 
-# ==========================================
+# ============================================================
 # STOP WORDS
-# ==========================================
+# ============================================================
 
 STOP_WORDS = {
     "what",
@@ -99,9 +103,9 @@ STOP_WORDS = {
 }
 
 
-# ==========================================
+# ============================================================
 # KEYWORD SEARCH
-# ==========================================
+# ============================================================
 
 def keyword_search(question, subject=None):
 
@@ -117,10 +121,6 @@ def keyword_search(question, subject=None):
 
     for i, chunk in enumerate(chunks):
 
-        # --------------------------------------
-        # HARD SUBJECT FILTER
-        # --------------------------------------
-
         if subject:
 
             if chunk["subject"].lower() != subject.lower():
@@ -130,10 +130,6 @@ def keyword_search(question, subject=None):
 
         text_words = set(text.split())
 
-        # --------------------------------------
-        # MATCH IMPORTANT WORDS
-        # --------------------------------------
-
         matches = set(query_words).intersection(
             text_words
         )
@@ -141,12 +137,7 @@ def keyword_search(question, subject=None):
         if not matches:
             continue
 
-        # Number of matching important words
         score = len(matches)
-
-        # --------------------------------------
-        # WORD COVERAGE BONUS
-        # --------------------------------------
 
         if len(query_words) > 0:
 
@@ -157,26 +148,19 @@ def keyword_search(question, subject=None):
 
             score += coverage * 5
 
-        # --------------------------------------
-        # EXACT PHRASE BONUS
-        # --------------------------------------
-
         important_phrase = " ".join(query_words)
 
         if (
             important_phrase
             and important_phrase in text
         ):
+
             score += 10
 
         results.append(
-            (
-                score,
-                i
-            )
+            (score, i)
         )
 
-    # Highest score first
     results.sort(
         key=lambda x: x[0],
         reverse=True
@@ -185,9 +169,9 @@ def keyword_search(question, subject=None):
     return results
 
 
-# ==========================================
+# ============================================================
 # SEMANTIC SEARCH
-# ==========================================
+# ============================================================
 
 def semantic_search(
     question,
@@ -203,10 +187,6 @@ def semantic_search(
         question_embedding
     ).astype("float32")
 
-    # --------------------------------------
-    # FAISS SEARCH
-    # --------------------------------------
-
     distances, indices = index.search(
         question_embedding,
         top_k
@@ -218,10 +198,6 @@ def semantic_search(
         distances[0],
         indices[0]
     ):
-
-        # --------------------------------------
-        # HARD SUBJECT FILTER
-        # --------------------------------------
 
         if subject:
 
@@ -241,9 +217,9 @@ def semantic_search(
     return results
 
 
-# ==========================================
+# ============================================================
 # HYBRID SEARCH
-# ==========================================
+# ============================================================
 
 def hybrid_search(
     question,
@@ -263,10 +239,7 @@ def hybrid_search(
 
     scores = {}
 
-
-    # ======================================
-    # KEYWORD SCORE
-    # ======================================
+    # Keyword scores
 
     for keyword_score, index_number in (
         keyword_results[:50]
@@ -277,10 +250,7 @@ def hybrid_search(
             + keyword_score * 20
         )
 
-
-    # ======================================
-    # SEMANTIC SCORE
-    # ======================================
+    # Semantic scores
 
     for rank, (
         distance,
@@ -289,8 +259,6 @@ def hybrid_search(
         semantic_results
     ):
 
-        # Semantic ranking gives a smaller
-        # contribution than keyword matching
         semantic_score = max(
             1,
             20 - rank
@@ -301,11 +269,6 @@ def hybrid_search(
             + semantic_score
         )
 
-
-    # ======================================
-    # FINAL SORT
-    # ======================================
-
     final_results = sorted(
         scores.items(),
         key=lambda x: x[1],
@@ -315,9 +278,9 @@ def hybrid_search(
     return final_results
 
 
-# ==========================================
-# BUILD TEXTBOOK CONTEXT
-# ==========================================
+# ============================================================
+# BUILD CONTEXT
+# ============================================================
 
 def build_context(
     results,
@@ -352,9 +315,82 @@ Textbook text:
     return "\n".join(context_parts)
 
 
-# ==========================================
-# ASK LLAMA
-# ==========================================
+# ============================================================
+# OLLAMA CLIENT
+# ============================================================
+
+def get_ollama_client():
+
+    """
+    Hybrid Ollama setup.
+
+    LOCAL:
+        Uses Ollama running on the user's computer.
+
+    CLOUD:
+        Uses Ollama Cloud through ollama.com.
+    """
+
+    # --------------------------------------------------------
+    # Try Streamlit Cloud secret first
+    # --------------------------------------------------------
+
+    api_key = None
+
+    try:
+
+        api_key = st.secrets.get(
+            "OLLAMA_API_KEY"
+        )
+
+    except Exception:
+
+        api_key = None
+
+    # --------------------------------------------------------
+    # Also check environment variable
+    # --------------------------------------------------------
+
+    if not api_key:
+
+        api_key = os.getenv(
+            "OLLAMA_API_KEY"
+        )
+
+    # --------------------------------------------------------
+    # CLOUD MODE
+    # --------------------------------------------------------
+
+    if api_key:
+
+        print(
+            "Using Ollama Cloud"
+        )
+
+        return ollama.Client(
+            host="https://ollama.com",
+            headers={
+                "Authorization":
+                    f"Bearer {api_key}"
+            }
+        )
+
+    # --------------------------------------------------------
+    # LOCAL MODE
+    # --------------------------------------------------------
+
+    print(
+        "Using local Ollama"
+    )
+
+    return ollama.Client(
+        host="http://localhost:11434"
+    )
+
+
+# ============================================================
+# GENERATE ANSWER
+# ============================================================
 
 def generate_answer(
     question,
@@ -377,38 +413,41 @@ STRICT RULES:
 3. Do NOT invent facts.
 
 4. Do NOT add information that is not present
-in the textbook evidence.
+   in the textbook evidence.
 
 5. Do NOT translate textbook terms unless the
-translation is explicitly present in the
-textbook evidence.
+   translation is explicitly present in the
+   textbook evidence.
 
 6. Do NOT explain the meaning of a term using
-your own knowledge.
+   your own knowledge.
 
 7. When quoting textbook evidence, copy the
-wording exactly.
+   wording exactly.
 
-8. If the supplied textbook evidence does not contain enough information
-to answer the student's question, DO NOT guess.
+8. If the supplied textbook evidence does not
+   contain enough information to answer the
+   student's question, say:
 
-Say exactly:
+"The textbook text I found does not provide enough
+information to answer this question. It may refer
+to a textbook diagram or figure."
 
-"The textbook text I found does not provide enough information to answer this question. It may refer to a textbook diagram or figure."
+Do not use outside knowledge to fill the
+missing information.
 
-Do not use outside knowledge to fill the missing information.
+9. The answer must directly answer the
+   student's question.
 
-9. The answer must directly answer the student's
-question.
-
-10. Keep the explanation short and suitable for
-    a Class 10 student.
+10. Keep the explanation short and suitable
+    for a Class 10 student.
 
 
 TEXTBOOK EVIDENCE:
 ------------------
 {context}
 ------------------
+
 
 STUDENT QUESTION:
 {question}
@@ -417,18 +456,20 @@ STUDENT QUESTION:
 Return EXACTLY this structure:
 
 
-. Answer:
+🎯 Answer:
 
 Give the direct answer in one sentence.
 
 Use only information supported by the evidence.
 
 
-Do NOT include a "📚 Textbook Evidence" section.
-The application will display the textbook evidence separately.
+📚 Textbook Evidence:
+
+Copy only the exact relevant sentence(s)
+from the supplied textbook evidence.
 
 
- Simple Explanation:
+💡 Simple Explanation:
 
 Explain the answer simply using ONLY the
 information present in the evidence.
@@ -437,12 +478,12 @@ Do NOT add definitions, translations,
 historical facts, or other knowledge.
 
 
- Question Pattern:
+🔎 Question Pattern:
 
 Describe what information the student needs
 to identify to answer this question.
 
-For example:
+Examples:
 
 "Person → Title"
 "Cause → Effect"
@@ -454,53 +495,126 @@ Do NOT give a generic explanation about
 words such as "who", "what", or "which".
 
 
- Memory Trick:
+🧠 Memory Trick:
 
-Give ONE short memory association using the
-names or terms in the evidence.
+Give ONE short memory association using
+the names or terms in the evidence.
 
 
- Similar Practice Question:
+📝 Similar Practice Question:
 
-Create ONE NEW question using ONLY the supplied textbook evidence.
+Create ONE NEW question using ONLY the
+supplied textbook evidence.
 
-STRICT RULES:
+The new question MUST:
 
-- The answer MUST be directly stated in the supplied evidence.
-- Do NOT make the answer from inference.
-- Do NOT use outside knowledge.
-- Do NOT ask about something that is only mentioned as a question in the textbook.
-- The new question must test the SAME question pattern.
-- The new question must ask about a DIFFERENT fact from the student's question.
-- The answer must be clearly found in the evidence.
+- test the SAME pattern as the student's question
+- ask about a DIFFERENT fact from the evidence
+- NOT repeat the student's question
+- NOT use outside knowledge
+- have an answer explicitly supported by the evidence
 
-If there is not enough information to create a valid
-similar practice question, write:
+For a "Person → Title" question, choose a
+DIFFERENT title from the evidence.
 
-"Not enough textbook evidence to create a similar practice question."
 
-For example, if the pattern is "Phenomenon → Name",
-ask about another phenomenon whose name is explicitly present
-in the supplied evidence.
+Format:
 
+Question:
+<new question>
+
+Answer:
+<short answer supported by the evidence>
 """
 
-    # ======================================
-    # OLLAMA
-    # ======================================
+    # ========================================================
+    # GET OLLAMA CLIENT
+    # ========================================================
 
-    response = ollama.chat(
-        model="llama3.2",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
+    client = get_ollama_client()
+
+
+    # ========================================================
+    # SELECT MODEL
+    # ========================================================
+
+    # Local model
+    local_model = "llama3.2"
+
+    # Ollama Cloud model
+    cloud_model = "gpt-oss:120b"
+
+
+    # Detect whether API key exists
+
+    api_key = None
+
+    try:
+
+        api_key = st.secrets.get(
+            "OLLAMA_API_KEY"
+        )
+
+    except Exception:
+
+        api_key = None
+
+    if not api_key:
+
+        api_key = os.getenv(
+            "OLLAMA_API_KEY"
+        )
+
+
+    if api_key:
+
+        selected_model = cloud_model
+
+    else:
+
+        selected_model = local_model
+
+
+    # ========================================================
+    # CALL OLLAMA
+    # ========================================================
+
+    try:
+
+        response = client.chat(
+
+            model=selected_model,
+
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+
+            options={
+                "temperature": 0
             }
-        ],
-        options={
-            "temperature": 0
-        }
-    )
+        )
 
-    return response["message"]["content"]
+        return response[
+            "message"
+        ]["content"]
 
+
+    except Exception as e:
+
+        return f"""
+⚠️ AI generation failed.
+
+Ollama connection error:
+
+{str(e)}
+
+If you are running locally, make sure Ollama
+is running and that llama3.2 is installed.
+
+If you are running on Streamlit Cloud,
+make sure OLLAMA_API_KEY is configured in
+Streamlit Secrets.
+"""
