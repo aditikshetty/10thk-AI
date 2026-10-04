@@ -1,5 +1,6 @@
+textbooks/*.pdf
+chunks.json
+embeddings.npy
 .venv/
-__pycache__/
 .env
-*.faiss
-database/
+__pycache__/
